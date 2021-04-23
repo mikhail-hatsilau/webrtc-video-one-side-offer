@@ -1,0 +1,28 @@
+* {
+    box-sizing: border-box;
+}
+
+.peers {
+    display: flex;
+}
+
+.peer1, .peer2 {
+    display: flex;
+    flex: 1 0 50%;
+    flex-direction: column;
+    padding: 0 5px;
+}
+
+video {
+    max-width: 100%;
+    margin-top: 10px;
+}
+
+canvas {
+    position: absolute;
+    left: -1000px;
+}
+
+ul {
+    list-style: none;
+}
