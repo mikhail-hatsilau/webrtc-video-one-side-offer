@@ -13,7 +13,10 @@ export const renderStreams = ({
         ${streams.map(
             (stream) => html`
                 <li>
-                    <video .srcObject=${stream.stream} autoplay></video>
+                    <div class="stream">
+                        <video .srcObject=${stream.stream} autoplay></video>
+                        <span>${stream.peerId}</span>
+                    </div>
                     ${upstreams
                         ? html`<button
                               @click=${() => removeUpstream(stream.stream.id)}

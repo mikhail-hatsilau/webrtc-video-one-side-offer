@@ -5,6 +5,9 @@ import fromPairs from 'lodash/fp/fromPairs';
 import map from 'lodash/fp/map';
 import omitBy from 'lodash/fp/omitBy';
 import omit from 'lodash/fp/omit';
+import values from 'lodash/fp/values';
+import some from 'lodash/fp/some';
+import negate from 'lodash/fp/negate';
 import PQueue from 'p-queue';
 import { rtcConfig } from './rtc-config.js';
 
@@ -13,11 +16,21 @@ const transceiverCurrentDirection = ['inactive'];
 
 export const PEER_UPDATED_EVENT = 'peerUpdated';
 
-const findInactiveTransceiver = (transceivers) =>
+const notReservedByRemotePeer = (mid, streamRegistry) =>
+    flow(
+        values,
+        some(({ transceiverId }) => transceiverId === mid),
+        negate(Boolean)
+    )(streamRegistry);
+
+const findInactiveTransceiver = (transceivers, streamRegistry) =>
     transceivers.find(
         (transceiver) =>
             transceiverDesiredDirections.includes(transceiver.direction) &&
-            transceiverCurrentDirection.includes(transceiver.currentDirection)
+            transceiverCurrentDirection.includes(
+                transceiver.currentDirection
+            ) &&
+            notReservedByRemotePeer(transceiver.mid, streamRegistry)
     );
 
 export const createConnection = (
@@ -38,6 +51,7 @@ export const createConnection = (
 
     pc.addEventListener('track', handleAddTrack);
     pc.addEventListener('icecandidate', handleLocalIceCandidate);
+
     eventEmitter.on('iceCandidate', handleRemoteIceCandidate);
     eventEmitter.on('streamAdded', handleRemoteStreamAdded);
     eventEmitter.on('streamRemoved', handleStreamRemoved);
@@ -93,7 +107,7 @@ export const createConnection = (
             await signalOffer(await createOffer());
 
             console.log(
-                `Local transceivers list of the peer ${peerId} after successfull blishing upstream`,
+                `Local transceivers list of the peer ${peerId} after successfull publishing upstream`,
                 getTransceivers()
             );
         });
@@ -101,17 +115,19 @@ export const createConnection = (
 
     function unpublishVideo() {
         console.log(`Unpublish upstream of the peer ${peerId}`);
-        streamRegistry = omitBy(
-            (streamData) => streamData.direction === 'up',
-            streamRegistry
-        );
-        peerEventsEmitter.emit(PEER_UPDATED_EVENT, streamRegistry);
         eventEmitter.emit('upstreamRemoved');
+
         tasksQueue.add(async () => {
             upstreamTransceiver.sender.replaceTrack(null);
             upstreamTransceiver.direction = 'recvonly';
 
             await signalOffer(await createOffer());
+
+            streamRegistry = omitBy(
+                (streamData) => streamData.direction === 'up',
+                streamRegistry
+            );
+            peerEventsEmitter.emit(PEER_UPDATED_EVENT, streamRegistry);
 
             console.log(
                 `Local transceivers list of the peer ${peerId} after successfull unblishing upstream`,
@@ -164,7 +180,8 @@ export const createConnection = (
             );
 
             let inactiveTransceiver = findInactiveTransceiver(
-                pc.getTransceivers()
+                pc.getTransceivers(),
+                streamRegistry
             );
 
             if (!inactiveTransceiver) {
@@ -194,10 +211,7 @@ export const createConnection = (
                 },
             };
 
-            await signalOffer(offer, {
-                transceiverId: inactiveTransceiver.mid,
-                streamId,
-            });
+            await signalOffer(offer);
 
             console.log(
                 `Local transceivers list of peer ${peerId} after adding downstream`,
@@ -208,10 +222,10 @@ export const createConnection = (
 
     function handleStreamRemoved(streamId) {
         console.log(`Removing downstream ${streamId} for peer ${peerId}`);
-        streamRegistry = omit([streamId], streamRegistry);
-        peerEventsEmitter.emit(PEER_UPDATED_EVENT, streamRegistry);
         tasksQueue.add(async () => {
             await signalOffer(await createOffer());
+            streamRegistry = omit([streamId], streamRegistry);
+            peerEventsEmitter.emit(PEER_UPDATED_EVENT, streamRegistry);
             console.log(
                 `Local transceivers list of peer ${peerId} after deleting downstream with id ${streamId}`,
                 getTransceivers()
@@ -219,10 +233,9 @@ export const createConnection = (
         });
     }
 
-    async function signalOffer(offer, additionalParams) {
+    async function signalOffer(offer) {
         eventEmitter.emit('createOffer', {
             offer,
-            ...additionalParams,
         });
 
         return new Promise((resolve) => {

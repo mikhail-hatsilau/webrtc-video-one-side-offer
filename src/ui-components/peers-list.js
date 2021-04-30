@@ -7,9 +7,7 @@ export const renderPeersList = ({ peers, onAddPeer }) => {
         <h2>Peers</h2>
         <button @click=${onAddPeer}>Add peer</button>
         <ul>
-            ${peers.map((peer) => {
-                renderPeer(peer);
-            })}
+            ${peers.map((peer) => renderPeer(peer))}
         </ul>
     `;
 };

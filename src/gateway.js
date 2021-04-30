@@ -5,8 +5,15 @@ import filter from 'lodash/fp/filter';
 import { rtcConfig } from './rtc-config.js';
 import { DELETE_EVENT_NAME, ADD_EVENT_NAME } from './stream-registry.js';
 
-const findTransceiverById = (transceivers, transceiverId) =>
-    transceivers.find((transceiver) => transceiver.mid === transceiverId);
+const transceiverDesiredDirections = ['recvonly', 'inactive', 'sendrecv'];
+const transceiverCurrentDirection = ['inactive', null];
+
+const findInactiveTransceiver = (transceivers) =>
+    transceivers.find(
+        (transceiver) =>
+            transceiverDesiredDirections.includes(transceiver.direction) &&
+            transceiverCurrentDirection.includes(transceiver.currentDirection)
+    );
 
 export const createConnection = (streamRegistry, eventEmitter, peerId) => {
     let streamTransceiverMap = {};
@@ -20,6 +27,8 @@ export const createConnection = (streamRegistry, eventEmitter, peerId) => {
     pc.addEventListener('track', handleAddTrack);
     pc.addEventListener('icecandidate', handleLocalIceCandidate);
 
+    notifyPeerDownstreamsExist(pc, streamRegistry);
+
     streamRegistry.on(ADD_EVENT_NAME, handleDownstreamAdd);
     streamRegistry.on(DELETE_EVENT_NAME, handleDownstreamRemoved);
 
@@ -27,15 +36,24 @@ export const createConnection = (streamRegistry, eventEmitter, peerId) => {
     eventEmitter.on('createOffer', handleCreateOffer);
     eventEmitter.on('peerIceCandidate', handlePeerIceCandidate);
 
-    const existingStreams = flow(
-        values,
-        filter((data) => typeof data !== 'function')
-    )(streamRegistry);
-
-    if (existingStreams.length) {
-        existingStreams.forEach((streamData) => {
-            addDownstream(streamData);
+    async function notifyPeerDownstreamsExist() {
+        await new Promise((resolve) => {
+            pc.addEventListener('connectionstatechange', () => {
+                if (pc.connectionState === 'connected') {
+                    resolve();
+                }
+            });
         });
+
+        const existingStreams = flow(
+            values,
+            filter((data) => typeof data !== 'function')
+        )(streamRegistry);
+        if (existingStreams.length) {
+            existingStreams.forEach((streamData) => {
+                addDownstream(streamData);
+            });
+        }
     }
 
     function handlePeerIceCandidate(candidate) {
@@ -50,49 +68,23 @@ export const createConnection = (streamRegistry, eventEmitter, peerId) => {
         eventEmitter.emit('iceCandidate', candidate);
     }
 
-    async function handleCreateOffer({ offer, transceiverId, streamId }) {
+    async function handleCreateOffer({ offer }) {
         await pc.setRemoteDescription(offer);
 
-        if (!(transceiverId && streamId)) {
+        if (!downstreams.length) {
             await answer();
-            console.log(
-                `Gateway: local transceivers after answering to the peer ${peerId}`,
-                pc.getTransceivers()
-            );
             return;
         }
 
-        const { stream } =
-            downstreams.find(
-                (downstream) => downstream.stream.id === streamId
-            ) || {};
+        const { stream } = downstreams.shift();
 
-        if (!stream) {
-            console.error(`Stream with ${streamId} was not announced`);
-            return;
-        }
-
-        downstreams = downstreams.filter(
-            (downstream) => downstream.stream.id !== streamId
-        );
-
-        const transceiver = findTransceiverById(
-            pc.getTransceivers(),
-            transceiverId
-        );
-
-        if (!transceiver) {
-            console.error(
-                `Local transceiver with id "${transceiverId}" can not be found`
-            );
-            return;
-        }
+        const transceiver = findInactiveTransceiver(pc.getTransceivers());
 
         streamTransceiverMap = {
             ...streamTransceiverMap,
             [stream.id]: {
                 stream,
-                transceiver,
+                transceiverId: transceiver.mid,
             },
         };
 
@@ -101,7 +93,7 @@ export const createConnection = (streamRegistry, eventEmitter, peerId) => {
 
         await answer();
         console.log(
-            `Gateway: local transceivers after adding track to the transceiver with id ${transceiverId} of peer ${peerId}`,
+            `Gateway: local transceivers after adding track to the transceiver with id ${transceiver.mid} of peer ${peerId}`,
             pc.getTransceivers()
         );
     }
@@ -138,7 +130,10 @@ export const createConnection = (streamRegistry, eventEmitter, peerId) => {
             return;
         }
 
-        const { transceiver } = streamTransceiverMap[streamId];
+        const { transceiverId } = streamTransceiverMap[streamId];
+        const transceiver = pc
+            .getTransceivers()
+            .find(({ mid }) => mid === transceiverId);
         transceiver.sender.replaceTrack(null);
         transceiver.direction = 'recvonly';
 
