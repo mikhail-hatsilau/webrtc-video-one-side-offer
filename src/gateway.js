@@ -1,19 +1,24 @@
 import omit from 'lodash/fp/omit';
 import values from 'lodash/fp/values';
 import flow from 'lodash/fp/flow';
+import find from 'lodash/fp/find';
 import filter from 'lodash/fp/filter';
 import { rtcConfig } from './rtc-config.js';
 import { DELETE_EVENT_NAME, ADD_EVENT_NAME } from './stream-registry.js';
 
-const transceiverDesiredDirections = ['recvonly', 'inactive', 'sendrecv'];
-const transceiverCurrentDirection = ['inactive', null];
+const getTransceivers = (pc) => pc.getTransceivers();
 
-const findInactiveTransceiver = (transceivers) =>
-    transceivers.find(
-        (transceiver) =>
-            transceiverDesiredDirections.includes(transceiver.direction) &&
-            transceiverCurrentDirection.includes(transceiver.currentDirection)
-    );
+const findTransceiverById = (transceiverId, pc) =>
+    flow(
+        getTransceivers,
+        find((transceiver) => transceiverId === transceiver.mid)
+    )(pc);
+
+const findTransceiverOfSender = (sender, pc) =>
+    flow(
+        getTransceivers,
+        find((transceiver) => transceiver.sender === sender)
+    )(pc);
 
 export const createConnection = (streamRegistry, eventEmitter, peerId) => {
     let streamTransceiverMap = {};
@@ -27,6 +32,10 @@ export const createConnection = (streamRegistry, eventEmitter, peerId) => {
     pc.addEventListener('track', handleAddTrack);
     pc.addEventListener('icecandidate', handleLocalIceCandidate);
 
+    pc.addEventListener('negotiationneeded', () => {
+        console.log('negotiation needed gateway');
+    });
+
     notifyPeerDownstreamsExist(pc, streamRegistry);
 
     streamRegistry.on(ADD_EVENT_NAME, handleDownstreamAdd);
@@ -38,8 +47,8 @@ export const createConnection = (streamRegistry, eventEmitter, peerId) => {
 
     async function notifyPeerDownstreamsExist() {
         await new Promise((resolve) => {
-            pc.addEventListener('connectionstatechange', () => {
-                if (pc.connectionState === 'connected') {
+            pc.addEventListener('signalingstatechange', () => {
+                if (pc.signalingState === 'stable') {
                     resolve();
                 }
             });
@@ -78,22 +87,20 @@ export const createConnection = (streamRegistry, eventEmitter, peerId) => {
 
         const { stream } = downstreams.shift();
 
-        const transceiver = findInactiveTransceiver(pc.getTransceivers());
+        const sender = pc.addTrack(stream.getTracks()[0], stream);
+        const senderTransceiver = findTransceiverOfSender(sender, pc);
 
         streamTransceiverMap = {
             ...streamTransceiverMap,
             [stream.id]: {
                 stream,
-                transceiverId: transceiver.mid,
+                transceiverId: senderTransceiver.mid,
             },
         };
 
-        await transceiver.sender.replaceTrack(stream.getTracks()[0]);
-        transceiver.direction = 'sendrecv';
-
         await answer();
         console.log(
-            `Gateway: local transceivers after adding track to the transceiver with id ${transceiver.mid} of peer ${peerId}`,
+            `Gateway: local transceivers after adding track to peer ${peerId}`,
             pc.getTransceivers()
         );
     }
@@ -131,11 +138,8 @@ export const createConnection = (streamRegistry, eventEmitter, peerId) => {
         }
 
         const { transceiverId } = streamTransceiverMap[streamId];
-        const transceiver = pc
-            .getTransceivers()
-            .find(({ mid }) => mid === transceiverId);
-        transceiver.sender.replaceTrack(null);
-        transceiver.direction = 'recvonly';
+        const transceiver = findTransceiverById(transceiverId, pc);
+        pc.removeTrack(transceiver.sender);
 
         streamTransceiverMap = omit([streamId], streamTransceiverMap);
 

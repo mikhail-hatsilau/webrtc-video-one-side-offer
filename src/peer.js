@@ -6,32 +6,40 @@ import map from 'lodash/fp/map';
 import omitBy from 'lodash/fp/omitBy';
 import omit from 'lodash/fp/omit';
 import values from 'lodash/fp/values';
-import some from 'lodash/fp/some';
-import negate from 'lodash/fp/negate';
+import find from 'lodash/fp/find';
+import curry from 'lodash/fp/curry';
 import PQueue from 'p-queue';
 import { rtcConfig } from './rtc-config.js';
 
-const transceiverDesiredDirections = ['recvonly', 'sendrecv'];
-const transceiverCurrentDirection = ['inactive'];
-
 export const PEER_UPDATED_EVENT = 'peerUpdated';
 
-const notReservedByRemotePeer = (mid, streamRegistry) =>
-    flow(
-        values,
-        some(({ transceiverId }) => transceiverId === mid),
-        negate(Boolean)
-    )(streamRegistry);
+const getTransceivers = (pc) => pc.getTransceivers();
 
-const findInactiveTransceiver = (transceivers, streamRegistry) =>
-    transceivers.find(
+const findTransceiverById = (transceiverId, pc) =>
+    flow(
+        getTransceivers,
+        find((transceiver) => transceiver.mid === transceiverId)
+    )(pc);
+
+const findInactiveTransceiver = flow(
+    getTransceivers,
+    find(
         (transceiver) =>
-            transceiverDesiredDirections.includes(transceiver.direction) &&
-            transceiverCurrentDirection.includes(
-                transceiver.currentDirection
-            ) &&
-            notReservedByRemotePeer(transceiver.mid, streamRegistry)
-    );
+            transceiver.currentDirection === 'inactive' &&
+            parseInt(transceiver.mid, 10) > 0
+    )
+);
+
+const addTransceiver = curry(
+    (pc, transceiver) =>
+        transceiver ||
+        pc.addTransceiver('video', {
+            direction: 'recvonly',
+        })
+);
+
+const addNewTransceiver = (pc) =>
+    flow(findInactiveTransceiver, addTransceiver(pc))(pc);
 
 export const createConnection = (
     gateway,
@@ -51,14 +59,15 @@ export const createConnection = (
 
     pc.addEventListener('track', handleAddTrack);
     pc.addEventListener('icecandidate', handleLocalIceCandidate);
+    pc.addEventListener('negotiationneeded', () => {
+        console.log('negotiation needed peer');
+    });
 
     eventEmitter.on('iceCandidate', handleRemoteIceCandidate);
     eventEmitter.on('streamAdded', handleRemoteStreamAdded);
     eventEmitter.on('streamRemoved', handleStreamRemoved);
 
-    // pc.addEventListener('connectionstatechange', handleConnectStateChange);
-
-    const upstreamTransceiver = pc.addTransceiver('video', {
+    pc.addTransceiver('audio', {
         direction: 'recvonly',
     });
 
@@ -74,15 +83,15 @@ export const createConnection = (
 
     async function connect() {
         tasksQueue.add(async () => {
-            await signalOffer(await createOffer());
-
-            return new Promise((resolve) => {
-                pc.addEventListener('connectionstatechange', () => {
-                    if (pc.connectionState === 'connected') {
+            const promise = new Promise((resolve) => {
+                pc.addEventListener('signalingstatechange', () => {
+                    if (pc.signalingState === 'stable') {
                         resolve();
                     }
                 });
             });
+            await signalOffer(await createOffer());
+            return promise;
         });
         gateway.connect(peerId, eventEmitter);
     }
@@ -90,21 +99,27 @@ export const createConnection = (
     async function publishVideo(stream) {
         console.log(`Publish upstream for peer ${peerId}`);
         tasksQueue.add(async () => {
-            upstreamTransceiver.sender.replaceTrack(stream.getTracks()[0]);
-            upstreamTransceiver.direction = 'sendrecv';
+            const sender = pc.addTrack(stream.getTracks()[0], stream);
+
+            const offer = await createOffer();
+
+            const transceiver = pc
+                .getTransceivers()
+                .find((transceiver) => transceiver.sender === sender);
 
             streamRegistry = {
                 ...streamRegistry,
                 [stream.id]: {
                     stream,
-                    transceiverId: upstreamTransceiver.mid,
+                    transceiverId: transceiver.mid,
                     peerId,
                     direction: 'up',
                 },
             };
+
             peerEventsEmitter.emit(PEER_UPDATED_EVENT, streamRegistry);
 
-            await signalOffer(await createOffer());
+            await signalOffer(offer);
 
             console.log(
                 `Local transceivers list of the peer ${peerId} after successfull publishing upstream`,
@@ -118,8 +133,27 @@ export const createConnection = (
         eventEmitter.emit('upstreamRemoved');
 
         tasksQueue.add(async () => {
-            upstreamTransceiver.sender.replaceTrack(null);
-            upstreamTransceiver.direction = 'recvonly';
+            const findUpstream = flow(
+                values,
+                find((stream) => stream.direction === 'up')
+            );
+
+            const upstreamData = findUpstream(streamRegistry);
+            if (!upstreamData) {
+                console.error('There is no active upstream');
+                return;
+            }
+
+            const transceiver = findTransceiverById(
+                upstreamData.transceiverId,
+                pc
+            );
+
+            if (transceiver.currentDirection !== 'sendrecv') {
+                transceiver.stop();
+            } else {
+                pc.removeTrack(transceiver.sender);
+            }
 
             await signalOffer(await createOffer());
 
@@ -140,19 +174,18 @@ export const createConnection = (
         pc.addIceCandidate(candidate);
     }
 
-    function handleAddTrack({ transceiver }) {
-        const assignTrackToStream = flow(
+    function handleAddTrack({ transceiver, streams }) {
+        const addStreamToRegistry = flow(
             entries,
             map((stream) => {
                 const [streamId, streamData] = stream;
-                if (streamData.transceiverId === transceiver.mid) {
+                if (streamId === streams[0].id) {
                     return [
                         streamId,
                         {
                             ...streamData,
-                            stream: new MediaStream([
-                                transceiver.receiver.track, // { [streamId]: { stream: MediaStream, peerId: 123, transceiverId: '0' } }
-                            ]),
+                            stream: streams[0],
+                            transceiverId: transceiver.mid,
                         },
                     ];
                 }
@@ -161,7 +194,7 @@ export const createConnection = (
             }),
             fromPairs
         );
-        streamRegistry = assignTrackToStream(streamRegistry);
+        streamRegistry = addStreamToRegistry(streamRegistry);
         peerEventsEmitter.emit(PEER_UPDATED_EVENT, streamRegistry);
     }
 
@@ -179,39 +212,18 @@ export const createConnection = (
                 `Downstream ${streamId} added for peer ${peerId}. Stream belongs to ${remotePeerId}`
             );
 
-            let inactiveTransceiver = findInactiveTransceiver(
-                pc.getTransceivers(),
-                streamRegistry
-            );
-
-            if (!inactiveTransceiver) {
-                inactiveTransceiver = pc.addTransceiver('video', {
-                    direction: 'recvonly',
-                });
-                console.log(
-                    `There are no inactive transceivers for peer ${peerId}. Adding new one`,
-                    inactiveTransceiver
-                );
-            } else {
-                console.log(
-                    `Found existing inactive transceiver for peer ${peerId}`,
-                    inactiveTransceiver
-                );
-            }
-
-            const offer = await createOffer();
+            addNewTransceiver(pc);
 
             streamRegistry = {
                 ...streamRegistry,
                 [streamId]: {
                     stream: null,
-                    transceiverId: inactiveTransceiver.mid,
                     peerId: remotePeerId,
                     direction: 'down',
                 },
             };
 
-            await signalOffer(offer);
+            await signalOffer(await createOffer());
 
             console.log(
                 `Local transceivers list of peer ${peerId} after adding downstream`,
@@ -223,6 +235,14 @@ export const createConnection = (
     function handleStreamRemoved(streamId) {
         console.log(`Removing downstream ${streamId} for peer ${peerId}`);
         tasksQueue.add(async () => {
+            const transceiver = findTransceiverById(
+                streamRegistry[streamId].transceiverId,
+                pc
+            );
+
+            if (transceiver.currentDirection !== 'sendrecv') {
+                transceiver.stop();
+            }
             await signalOffer(await createOffer());
             streamRegistry = omit([streamId], streamRegistry);
             peerEventsEmitter.emit(PEER_UPDATED_EVENT, streamRegistry);
